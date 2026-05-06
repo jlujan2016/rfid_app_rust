@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-tiberius = { version = "0.12", features = ["sql-browser-tokio"] }
-tokio-util = "0.7"
 anyhow = "1"
+tiberius = { version = "0.12", default-features = false, features = ["tokio", "rustls"] }
+tokio-util = "0.7"
+hex = "0.4"
