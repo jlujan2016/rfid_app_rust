@@ -3,20 +3,31 @@ use tokio::io::AsyncReadExt;
 
 use tiberius::{Client, Config};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
-
+use dotenvy::dotenv;
+use std::env;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+     dotenv().ok(); // 👈 cargar variables .env
     // =========================
     // 🔌 CONEXIÓN SQL SERVER
     // =========================
     let mut config = Config::new();
-    config.host("0_Ciberelectrik.mssql.somee.com");
-    config.port(1433);
-    config.authentication(tiberius::AuthMethod::sql_server("jlujan_SQLLogin_1", "yyeftklvtf"));
-    config.database("0_Ciberelectrik");
+    let db_host = env::var("DB_HOST")?;
+    let db_port = env::var("DB_PORT")?.parse::<u16>()?;
+    let db_name = env::var("DB_NAME")?;
+    let db_user = env::var("DB_USER")?;
+    let db_pass = env::var("DB_PASS")?;
+
+    let rfid_host = env::var("RFID_HOST")?;
+    let rfid_port = env::var("RFID_PORT")?.parse::<u16>()?;
+
+    config.host(&db_host);
+    config.port(db_port);
+    config.authentication(tiberius::AuthMethod::sql_server(&db_user, &db_pass));
+    config.database(&db_name);
     config.trust_cert();
 
-    let tcp = TcpStream::connect("0_Ciberelectrik.mssql.somee.com:1433").await?;
+    let tcp = TcpStream::connect(format!("{}:{}", db_host, db_port)).await?;
     tcp.set_nodelay(true)?;
 
     let mut client = Client::connect(config, tcp.compat_write()).await?;
@@ -26,7 +37,7 @@ async fn main() -> anyhow::Result<()> {
     // =========================
     // 📡 CONEXIÓN UR4
     // =========================
-    let mut stream = TcpStream::connect("127.0.0.1:5084").await?;
+    let mut stream = TcpStream::connect(format!("{}:{}", rfid_host, rfid_port)).await?;
     println!("✅ Conectado al UR4");
 
     let mut buffer = [0u8; 1024];
