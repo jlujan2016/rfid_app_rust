@@ -3,12 +3,15 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use tiberius::{Client, Config};
 use tokio_util::compat::TokioAsyncWriteCompatExt;
+
 use dotenvy::dotenv;
 use std::env;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+
 use std::collections::HashMap;
 use std::time::{Instant, Duration};
+
 fn build_command(command: u8, data: &[u8]) -> Vec<u8> {
     let length = (8 + data.len()) as u16;
 
@@ -20,31 +23,28 @@ fn build_command(command: u8, data: &[u8]) -> Vec<u8> {
     }
 
     let mut frame = Vec::new();
-
     frame.push(0xA5);
     frame.push(0x5A);
-
     frame.push((length >> 8) as u8);
     frame.push(length as u8);
-
     frame.push(command);
-
     frame.extend_from_slice(data);
-
     frame.push(checksum);
-
     frame.push(0x0D);
     frame.push(0x0A);
 
     frame
 }
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-     dotenv().ok(); // 👈 cargar variables .env
+    dotenv().ok();
+
     // =========================
-    // 🔌 CONEXIÓN SQL SERVER
+    // 🔌 SQL SERVER
     // =========================
     let mut config = Config::new();
+
     let db_host = env::var("DB_HOST")?;
     let db_port = env::var("DB_PORT")?.parse::<u16>()?;
     let db_name = env::var("DB_NAME")?;
@@ -64,154 +64,128 @@ async fn main() -> anyhow::Result<()> {
     tcp.set_nodelay(true)?;
 
     let client = Arc::new(Mutex::new(
-    Client::connect(config, tcp.compat_write()).await?
+        Client::connect(config, tcp.compat_write()).await?
     ));
 
     println!("✅ Conectado a SQL Server");
 
     // =========================
-    // 📡 CONEXIÓN UR4
+    // 📡 UR4 RFID
     // =========================
     let mut stream = TcpStream::connect(format!("{}:{}", rfid_host, rfid_port)).await?;
     println!("✅ Conectado al UR4");
-// 🔥 1. poner modo lector (IMPORTANTE)
-stream.write_all(&build_command(0x60, &[0x01])).await?;
-println!("⚙️ Modo inventario configurado");
 
-// pequeño delay recomendado
-tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    // modo lector
+    stream.write_all(&build_command(0x60, &[0x01])).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
 
-// 🔥 2. iniciar inventario
-let start_inventory = build_command(0x82, &[0x00, 0x00]);
-stream.write_all(&start_inventory).await?;
-println!("📡 Inventario iniciado");
+    // iniciar inventario
+    stream.write_all(&build_command(0x82, &[0x00, 0x00])).await?;
+    println!("📡 Inventario iniciado");
 
     let mut buffer: Vec<u8> = Vec::new();
     let mut temp = [0u8; 1024];
-    use std::collections::HashMap;
-use std::time::Instant;
 
-let mut cache: HashMap<String, Instant> = HashMap::new();
+    let mut cache: HashMap<String, Instant> = HashMap::new();
 
-    // 📡 loop de lectura
-loop {
-    let n = stream.read(&mut temp).await?;
-    buffer.extend_from_slice(&temp[..n]);
-
-    println!("RAW: {:?}", &temp[..n]);
-
-    let mut i = 0;
-
-    while i + 4 < buffer.len() {
-        if buffer[i] != 0xA5 || buffer[i + 1] != 0x5A {
-            i += 1;
+    loop {
+        let n = stream.read(&mut temp).await?;
+        if n == 0 {
             continue;
         }
 
-        let length = ((buffer[i + 2] as usize) << 8) | buffer[i + 3] as usize;
+        buffer.extend_from_slice(&temp[..n]);
 
-        if i + length > buffer.len() {
+        let mut i = 0;
+
+        while i + 4 < buffer.len() {
+            if buffer[i] != 0xA5 || buffer[i + 1] != 0x5A {
+                i += 1;
+                continue;
+            }
+
+            let length = ((buffer[i + 2] as usize) << 8) | buffer[i + 3] as usize;
+
+            if i + length > buffer.len() {
+                break;
+            }
+
+            let frame = &buffer[i..i + length];
+
+            // =========================
+            // 🔥 UR4 INVENTORY FRAME
+            // =========================
+if frame.len() > 6 && frame[4] == 0x83 {
+
+    // payload del lector
+    let payload = &frame[5..frame.len().saturating_sub(2)];
+
+    // buscar secuencia de EPC válida dentro del payload
+    let mut found = String::new();
+
+    for window in payload.windows(4) {
+
+        // heurística UR4: EPC corto tipo 4 bytes
+        let candidate = hex::encode(window);
+
+        // filtro fuerte: solo valores tipo 00410002
+        if candidate.starts_with("0041") || candidate.starts_with("0040") {
+
+            found = candidate;
             break;
         }
+    }
 
-        let frame = &buffer[i..i + length];
+    if !found.is_empty() {
 
-        if frame.len() > 5 && frame[4] == 0x83 {
-            let epc_data = &frame[5..frame.len().saturating_sub(3)];
+        let now = Instant::now();
 
-            if !epc_data.is_empty() {
-                let epc = hex::encode(epc_data);
-
-                let now = Instant::now();
-
-                if let Some(last) = cache.get(&epc) {
-                    if now.duration_since(*last) < Duration::from_secs(2) {
-                        i += length;
-                        continue;
-                    }
-                }
-
-                cache.insert(epc.clone(), now);
-
-                println!("📦 TAG: {}", epc);
-
-                guardar_epc(client.clone(), &epc).await?;
+        if let Some(last) = cache.get(&found) {
+            if now.duration_since(*last) < Duration::from_secs(2) {
+                i += length;
+                continue;
             }
         }
 
-        i += length;
+        cache.insert(found.clone(), now);
+
+        println!("📦 TAG LIMPIO: {}", found);
+
+        guardar_epc(client.clone(), &found).await?;
     }
-
-    buffer.drain(0..i);
 }
-}
-// =========================
-// 🧠 EXTRAER EPC
-// =========================
-fn extract_all_epcs(data: &[u8]) -> Vec<String> {
-    let mut epcs = Vec::new();
-    let mut i = 0;
 
-    while i + 4 < data.len() {
-        // Buscar inicio de frame A5 5A
-        if data[i] != 0xA5 || data[i + 1] != 0x5A {
-            i += 1;
-            continue;
+            i += length;
         }
 
-        // Leer longitud del frame
-        let length = ((data[i + 2] as usize) << 8) | data[i + 3] as usize;
-
-        // Validar que el frame completo está en el buffer
-        if i + length > data.len() {
-            break; // frame incompleto, esperar más datos
-        }
-
-        let frame = &data[i..i + length];
-
-        // Buscar EPC (0xE2 + 12 bytes) dentro del frame
-        if let Some(rel_pos) = frame.windows(1).position(|w| w[0] == 0xE2) {
-            if rel_pos + 12 <= frame.len() {
-                let epc = hex::encode(&frame[rel_pos..rel_pos + 12]);
-
-                // Evitar duplicados dentro del mismo chunk
-                if !epcs.contains(&epc) {
-                    epcs.push(epc);
-                }
-            }
-        }
-
-        i += length; // saltar al siguiente frame
+        buffer.drain(0..i);
     }
-
-    epcs
 }
 
 // =========================
-// 💾 INSERTAR EN SQL
+// 💾 SQL INSERT
 // =========================
 async fn guardar_epc(
-    client: Arc<Mutex<Client<tokio_util::compat::Compat<tokio::net::TcpStream>>>>,
+    client: Arc<Mutex<Client<tokio_util::compat::Compat<TcpStream>>>>,
     epc: &str,
 ) -> anyhow::Result<()> {
 
-        let query = "
+    let query = "
         INSERT INTO LecturasRFID (EPC)
         SELECT @P1
         WHERE NOT EXISTS (
             SELECT 1 FROM LecturasRFID WHERE EPC = @P1
         )
-        ";
+    ";
 
     let mut client = client.lock().await;
 
     match client.execute(query, &[&epc]).await {
         Ok(r) => {
-            let rows = r.total();
-            if rows == 0 {
-                println!("⚠️ NO INSERT (posible duplicado o filtro): {}", epc);
-            } else {
+            if r.total() > 0 {
                 println!("💾 INSERT OK: {}", epc);
+            } else {
+                println!("⚠️ DUPLICADO: {}", epc);
             }
         }
         Err(e) => {
