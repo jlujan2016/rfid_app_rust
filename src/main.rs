@@ -12,6 +12,9 @@ use tokio::sync::Mutex;
 use std::collections::HashMap;
 use std::time::{Instant, Duration};
 
+// =========================
+// 🔧 CONSTRUIR COMANDO
+// =========================
 fn build_command(command: u8, data: &[u8]) -> Vec<u8> {
     let length = (8 + data.len()) as u16;
 
@@ -36,6 +39,29 @@ fn build_command(command: u8, data: &[u8]) -> Vec<u8> {
     frame
 }
 
+// =========================
+// 🏷️ EXTRAER EPC
+// =========================
+fn extraer_epc(payload: &[u8]) -> Option<String> {
+    // Necesitamos al menos 6 bytes para que haya algo entre
+    // byte[2] y los ultimos 4 bytes de metadata
+    if payload.len() < 6 {
+        return None;
+    }
+
+    // El EPC siempre empieza en byte[2]
+    // Los ultimos 4 bytes siempre son RSSI/metadata → los ignoramos
+    let epc_start = 2;
+    let epc_end   = payload.len() - 4;
+
+    let epc = hex::encode(&payload[epc_start..epc_end]);
+
+    Some(epc)
+}
+
+// =========================
+// 🚀 MAIN
+// =========================
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     dotenv().ok();
@@ -72,22 +98,22 @@ async fn main() -> anyhow::Result<()> {
     // =========================
     // 📡 UR4 RFID
     // =========================
-    let mut stream = TcpStream::connect(format!("{}:{}", rfid_host, rfid_port)).await?;
+    let mut stream = TcpStream::connect(
+        format!("{}:{}", rfid_host, rfid_port)
+    ).await?;
     println!("✅ Conectado al UR4");
-
     // modo lector
     stream.write_all(&build_command(0x60, &[0x01])).await?;
     tokio::time::sleep(Duration::from_millis(200)).await;
-
     // iniciar inventario
     stream.write_all(&build_command(0x82, &[0x00, 0x00])).await?;
     println!("📡 Inventario iniciado");
 
     let mut buffer: Vec<u8> = Vec::new();
-    let mut temp = [0u8; 1024];
-
+    let mut temp   = [0u8; 1024];
     let mut cache: HashMap<String, Instant> = HashMap::new();
 
+    // --- LOOP PRINCIPAL ---
     loop {
         let n = stream.read(&mut temp).await?;
         if n == 0 {
@@ -99,65 +125,54 @@ async fn main() -> anyhow::Result<()> {
         let mut i = 0;
 
         while i + 4 < buffer.len() {
+
+            // Buscar cabecera A5 5A
             if buffer[i] != 0xA5 || buffer[i + 1] != 0x5A {
                 i += 1;
                 continue;
             }
 
-            let length = ((buffer[i + 2] as usize) << 8) | buffer[i + 3] as usize;
+            // Leer longitud de la trama
+            let length = ((buffer[i + 2] as usize) << 8)
+                        | buffer[i + 3] as usize;
 
+            // Si no llegaron todos los bytes todavia, esperar
             if i + length > buffer.len() {
                 break;
             }
 
             let frame = &buffer[i..i + length];
-
             // =========================
             // 🔥 UR4 INVENTORY FRAME
             // =========================
-if frame.len() > 6 && frame[4] == 0x83 {
+            // Es una trama de tag detectado (comando 0x83)
+            if frame.len() > 6 && frame[4] == 0x83 {
+                // payload del lector
+                let payload = &frame[5..frame.len().saturating_sub(2)];
 
-    // payload del lector
-    let payload = &frame[5..frame.len().saturating_sub(2)];
+                if let Some(epc) = extraer_epc(payload) {
+                    let now = Instant::now();
 
-    // buscar secuencia de EPC válida dentro del payload
-    let mut found = String::new();
+                    // Verificar cache: si el mismo tag fue leido
+                    // hace menos de 2 segundos, ignorarlo
+                    let es_reciente = cache
+                        .get(&epc)
+                        .map(|ultimo| now.duration_since(*ultimo)
+                             < Duration::from_secs(2))
+                        .unwrap_or(false);
 
-    for window in payload.windows(4) {
-
-        // heurística UR4: EPC corto tipo 4 bytes
-        let candidate = hex::encode(window);
-
-        // filtro fuerte: solo valores tipo 00410002
-        if candidate.starts_with("0041") || candidate.starts_with("0040") {
-
-            found = candidate;
-            break;
-        }
-    }
-
-    if !found.is_empty() {
-
-        let now = Instant::now();
-
-        if let Some(last) = cache.get(&found) {
-            if now.duration_since(*last) < Duration::from_secs(2) {
-                i += length;
-                continue;
+                    if !es_reciente {
+                        cache.insert(epc.clone(), now);
+                        println!("📦 TAG DETECTADO: {}", epc);
+                        guardar_epc(client.clone(), &epc).await?;
+                    }
+                }
             }
-        }
-
-        cache.insert(found.clone(), now);
-
-        println!("📦 TAG LIMPIO: {}", found);
-
-        guardar_epc(client.clone(), &found).await?;
-    }
-}
 
             i += length;
         }
 
+        // Descartar bytes ya procesados
         buffer.drain(0..i);
     }
 }
@@ -183,13 +198,13 @@ async fn guardar_epc(
     match client.execute(query, &[&epc]).await {
         Ok(r) => {
             if r.total() > 0 {
-                println!("💾 INSERT OK: {}", epc);
+                println!("💾 INSERT OK : {}", epc);
             } else {
-                println!("⚠️ DUPLICADO: {}", epc);
+                println!("⚠️  YA EXISTE : {}", epc);
             }
         }
         Err(e) => {
-            eprintln!("❌ SQL ERROR: {:?}", e);
+            eprintln!("❌ SQL ERROR  : {:?}", e);
         }
     }
 
